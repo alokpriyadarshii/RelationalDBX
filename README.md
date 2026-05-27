@@ -273,7 +273,7 @@ Stop the local FoundationDB container when finished:
 ./docker-local/stop.sh
 ```
 
-## Using the Embedded JDBC Driver
+## Using The Embedded JDBC Driver
 
 The embedded driver uses `jdbc:embed:` URLs and runs in the same JVM as the application.
 
@@ -315,7 +315,7 @@ INSERT INTO products VALUES (2, 'Mouse', 'Accessories', 999, 80);
 SELECT * FROM products WHERE category = 'Accessories' ORDER BY price;
 ```
 
-## Running the CLI
+## Running The CLI
 
 Build the CLI distribution:
 
@@ -337,7 +337,7 @@ You can also connect to an application database:
   -u "jdbc:embed:/FRL/shop?schema=SHOP"
 ```
 
-## Running the gRPC Server
+## Running The gRPC Server
 
 Build the server distribution:
 
