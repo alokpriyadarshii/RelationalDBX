@@ -1,0 +1,14 @@
+======
+CREATE
+======
+
+.. toctree::
+    :maxdepth: 1
+
+    CREATE/SCHEMA_TEMPLATE
+    CREATE/DATABASE
+    CREATE/SCHEMA
+    CREATE/TABLE
+    CREATE/TYPE
+    CREATE/INDEX
+    CREATE/FUNCTION

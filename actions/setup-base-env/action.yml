@@ -1,0 +1,25 @@
+name: Setup Base Environment
+
+outputs:
+  python-version:
+    value: ${{ steps.setup-python.outputs.python-version }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Setup JDK
+      uses: actions/setup-java@v5.2.0
+      with:
+        java-version: '21'
+        distribution: 'temurin'
+    - name: Setup Gradle
+      # Use setup-gradle v6.1.0
+      uses: gradle/actions/setup-gradle@50e97c2cd7a37755bbfafc9c5b7cafaece252f6e
+      with:
+        # Use the MIT-licensed cache provider
+        cache-provider: basic
+    - name: Setup Python
+      id: setup-python
+      uses: actions/setup-python@v6.2.0
+      with:
+        python-version: '3.13'

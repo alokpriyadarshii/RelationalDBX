@@ -1,0 +1,34 @@
+syntax = "proto2";
+
+package com.apple.foundationdb.record.nestedmaptest;
+
+option java_package = "com.apple.foundationdb.record";
+option java_outer_classname = "TestRecordsNestedMapProto";
+
+import "record_metadata_options.proto";
+
+message OuterRecord {
+    optional int64 rec_id = 1 [(field).primary_key = true];
+    optional int64 other_id = 2;
+    optional MapRecord map = 3;
+}
+
+message MapRecord {
+    message Entry {
+        optional string key = 1;
+        optional string value = 2;
+        optional int64 int_value = 3;
+    }
+    repeated Entry entry = 1;
+}
+
+message OtherRecord {
+    optional int64 rec_id = 1 [(field).primary_key = true];
+    optional int64 other_id = 2;
+    optional string other_value = 3;
+}
+
+message RecordTypeUnion {
+    optional OuterRecord _OuterRecord = 1;
+    optional OtherRecord _OtherRecord = 2;
+}

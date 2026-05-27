@@ -1,0 +1,166 @@
+/*
+ * LuceneOptimizedCodec.java
+ *
+ * This source file is part of the FoundationDB open source project
+ *
+ * Copyright 2015-2021 Apple Inc. and the FoundationDB project authors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package com.apple.foundationdb.record.lucene.codec;
+
+import com.google.auto.service.AutoService;
+import org.apache.lucene.codecs.Codec;
+import org.apache.lucene.codecs.CompoundFormat;
+import org.apache.lucene.codecs.DocValuesFormat;
+import org.apache.lucene.codecs.FieldInfosFormat;
+import org.apache.lucene.codecs.LiveDocsFormat;
+import org.apache.lucene.codecs.NormsFormat;
+import org.apache.lucene.codecs.PointsFormat;
+import org.apache.lucene.codecs.PostingsFormat;
+import org.apache.lucene.codecs.SegmentInfoFormat;
+import org.apache.lucene.codecs.StoredFieldsFormat;
+import org.apache.lucene.codecs.TermVectorsFormat;
+import org.apache.lucene.codecs.lucene50.Lucene50CompoundFormat;
+import org.apache.lucene.codecs.lucene80.Lucene80DocValuesFormat;
+import org.apache.lucene.codecs.lucene84.Lucene84PostingsFormat;
+import org.apache.lucene.codecs.lucene86.Lucene86SegmentInfoFormat;
+import org.apache.lucene.codecs.lucene87.Lucene87Codec;
+import org.apache.lucene.codecs.perfield.PerFieldDocValuesFormat;
+import org.apache.lucene.codecs.perfield.PerFieldPostingsFormat;
+
+/**
+ *
+ * Codec with a few optimizations for speeding up compound files
+ * sitting on FoundationDB.
+ *
+ * Optimizations:
+ * - .cfe file references are not stored
+ * - .cfe file data is serialized as entries on the current compound file reference (.cfs)
+ * - .si file references are not stored
+ * - .si file data is serialized as segmentInfo on the current compound file reference (.cfs)
+ * - .si diagnostic information is not stored
+ * - Removed checksum validation on Compound File Reader
+ *
+ * Forwards/backwards compatibility is not supported during transition from the {@link Lucene87Codec} to this implementation unfortunately.
+ * Indexes need to rebuilt before handling search requests.
+ *
+ */
+@AutoService(Codec.class)
+public class LuceneOptimizedCodec extends Codec {
+
+    private final Lucene87Codec baseCodec;
+    private final CompoundFormat compoundFormat;
+    private final SegmentInfoFormat segmentInfoFormat;
+    private final PointsFormat pointsFormat;
+    private final StoredFieldsFormat storedFieldsFormat;
+    private final PostingsFormat defaultPostingsFormat;
+    private final DocValuesFormat defaultDocValuesFormat;
+    private final LiveDocsFormat liveDocsFormat;
+    private final FieldInfosFormat fieldInfosFormat;
+
+    private final PostingsFormat postingsFormat = new PerFieldPostingsFormat() {
+        @Override
+        public PostingsFormat getPostingsFormatForField(String field) {
+            return LuceneOptimizedCodec.this.getPostingsFormatForField(field);
+        }
+    };
+
+    private final DocValuesFormat docValuesFormat = new PerFieldDocValuesFormat() {
+        @Override
+        public DocValuesFormat getDocValuesFormatForField(String field) {
+            return LuceneOptimizedCodec.this.getDocValuesFormatForField(field);
+        }
+    };
+
+    public static final LuceneOptimizedCodec CODEC = new LuceneOptimizedCodec();
+
+    /**
+     * Instantiates a new codec.
+     * <p>
+     *     The constant "RL" is an arbitrary name for the codec that will be written into the index segment.
+     * </p>
+     */
+    public LuceneOptimizedCodec() {
+        super("RL");
+        baseCodec = new Lucene87Codec(Lucene87Codec.Mode.BEST_SPEED);
+        compoundFormat = new LuceneOptimizedCompoundFormat(new Lucene50CompoundFormat());
+        segmentInfoFormat = new Lucene86SegmentInfoFormat();
+        pointsFormat = new LuceneOptimizedPointsFormat(baseCodec.pointsFormat());
+        defaultPostingsFormat = new LuceneOptimizedPostingsFormat(new Lucene84PostingsFormat());
+        defaultDocValuesFormat = new LuceneOptimizedDocValuesFormat(new Lucene80DocValuesFormat());
+        storedFieldsFormat = new LuceneOptimizedStoredFieldsFormat(baseCodec.storedFieldsFormat());
+        liveDocsFormat = new LuceneOptimizedLiveDocsFormat(baseCodec.liveDocsFormat());
+        fieldInfosFormat = new LuceneOptimizedFieldInfosFormat();
+    }
+
+    @Override
+    public PostingsFormat postingsFormat() {
+        return postingsFormat;
+    }
+
+    @Override
+    public DocValuesFormat docValuesFormat() {
+        return docValuesFormat;
+    }
+
+    @Override
+    public StoredFieldsFormat storedFieldsFormat() {
+        return storedFieldsFormat;
+    }
+
+    @Override
+    public TermVectorsFormat termVectorsFormat() {
+        return baseCodec.termVectorsFormat();
+    }
+
+    @Override
+    public FieldInfosFormat fieldInfosFormat() {
+        return fieldInfosFormat;
+    }
+
+    @Override
+    public SegmentInfoFormat segmentInfoFormat() {
+        return segmentInfoFormat;
+    }
+
+    @Override
+    public NormsFormat normsFormat() {
+        return baseCodec.normsFormat();
+    }
+
+    @Override
+    public LiveDocsFormat liveDocsFormat() {
+        return liveDocsFormat;
+    }
+
+    @Override
+    public CompoundFormat compoundFormat() {
+        return compoundFormat;
+    }
+
+    @Override
+    public PointsFormat pointsFormat() {
+        return pointsFormat;
+    }
+
+    public PostingsFormat getPostingsFormatForField(String field) {
+        return defaultPostingsFormat;
+    }
+
+    public DocValuesFormat getDocValuesFormatForField(String field) {
+        return defaultDocValuesFormat;
+    }
+
+}

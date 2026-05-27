@@ -1,0 +1,369 @@
+/*
+ * MatchCandidate.java
+ *
+ * This source file is part of the FoundationDB open source project
+ *
+ * Copyright 2015-2020 Apple Inc. and the FoundationDB project authors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package com.apple.foundationdb.record.query.plan.cascades;
+
+import com.apple.foundationdb.record.EvaluationContext;
+import com.apple.foundationdb.record.metadata.RecordType;
+import com.apple.foundationdb.record.metadata.expressions.KeyExpression;
+import com.apple.foundationdb.record.query.expressions.Comparisons;
+import com.apple.foundationdb.record.query.plan.ScanComparisons;
+import com.apple.foundationdb.record.query.plan.cascades.OrderingPart.MatchedOrderingPart;
+
+import com.apple.foundationdb.record.query.plan.cascades.expressions.RelationalExpression;
+import com.apple.foundationdb.record.query.plan.cascades.predicates.QueryPredicate;
+import com.apple.foundationdb.record.query.plan.cascades.typing.Type;
+import com.apple.foundationdb.record.query.plan.cascades.values.Value;
+import com.apple.foundationdb.record.query.plan.cascades.values.simplification.OrderingValueComputationRuleSet;
+import com.apple.foundationdb.record.query.plan.cascades.values.translation.PullUp;
+import com.apple.foundationdb.record.query.plan.plans.RecordQueryPlan;
+import com.apple.foundationdb.record.util.pair.NonnullPair;
+import com.google.common.base.Verify;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.Maps;
+import com.google.common.collect.Multimaps;
+import com.google.common.collect.SetMultimap;
+
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+
+/**
+ * Interface to represent a match candidate. A match candidate on code level is just a name and a data flow graph
+ * that can be matched against a query graph. The match candidate does not keep the root to the graph to be matched but
+ * rather an instance of {@link Traversal} to allow for navigation of references within the candidate.
+ *
+ * Match candidates also allow for creation of scans over the materialized data, e.g. the index for an
+ * {@link ValueIndexScanMatchCandidate} or the primary range for a {@link PrimaryScanMatchCandidate}, given appropriate
+ * {@link ComparisonRange}s which usually are the direct result of graph matching.
+ */
+public interface MatchCandidate {
+
+    /**
+     * Returns the name of the match candidate. If this candidate represents an index, it will be the name of the index.
+     *
+     * @return the name of this match candidate
+     */
+    @Nonnull
+    String getName();
+
+    /**
+     * Returns the traversal object for this candidate. The traversal object can either be computed up-front when
+     * the candidate is created or lazily when this method is invoked. It is, however, necessary that the traversal
+     * once computed is stable, meaning the object returned by implementors of this method must always return the
+     * same object.
+     * @return the traversal associated for this match candidate
+     */
+    @Nonnull
+    Traversal getTraversal();
+
+    /**
+     * Returns a list of parameter names for sargable parameters that can to be bound during matching.
+     * @return a list of {@link CorrelationIdentifier}s for all sargable parameters in this match candidate
+     */
+    @Nonnull
+    List<CorrelationIdentifier> getSargableAliases();
+
+    /**
+     * Returns the parameter names for the resulting order for parameters that can be bound during matching
+     * (sargable and residual).
+     * @return a list of {@link CorrelationIdentifier}s describing the ordering of the result set of this match candidate
+     */
+    @Nonnull
+    List<CorrelationIdentifier> getOrderingAliases();
+
+    /**
+     * Returns the set of sargable (Search ARGument ABLE) parameter aliases that must be bound with concrete values
+     * for this match candidate to be considered valid during query planning.
+     * <p>
+     * This method specifies binding requirements that act as prerequisites for using this match candidate in a query
+     * plan. During the matching phase, the query planner attempts to bind parameters through predicates and
+     * placeholders. For a match candidate to be selected, all aliases returned by this method must have been
+     * successfully bound to values.
+     * </p>
+     * <p>
+     * The default implementation returns an empty set, indicating that no specific parameter bindings are required.
+     * Match candidates that have binding requirements should override this method to specify their constraints.
+     * </p>
+     *
+     * @return a set of {@link CorrelationIdentifier}s representing parameter aliases that must be bound;
+     *         returns an empty set if no bindings are required
+     * @see PartialMatch#getBoundSargableAliases() for the set of actually bound aliases in a partial match
+     * @see #getSargableAliases() for all available sargable aliases (whether required or optional)
+     */
+    @Nonnull
+    default Set<CorrelationIdentifier> getSargableAliasesRequiredForBinding() {
+        return ImmutableSet.of();
+    }
+
+    /**
+     * This method returns a key expression that can be used to actually compute the keys of this candidate for a
+     * given record.
+     * The current expression hierarchy cannot be evaluated at runtime (in general). This key expression helps
+     * represent compensation or part of compensation if needed.
+     * @return a key expression that can be evaluated based on a base record
+     */
+    @Nonnull
+    KeyExpression getFullKeyExpression();
+
+    boolean createsDuplicates();
+
+    /**
+     * Computes a map from {@link CorrelationIdentifier} to {@link ComparisonRange} that is physically compatible with
+     * a scan over the materialized version of the match candidate, so e.g. for an {@link ValueIndexScanMatchCandidate} that
+     * would be the scan over the index.
+     * As matching progresses it finds mappings from parameters to corresponding comparison ranges. Matching, however,
+     * is not sensitive to whether such a binding could actually be used in an index scan. In fact, in a different maybe
+     * future RelationalDBX with improved physical operators this method should be revised to account for those improvements.
+     * For now, we only consider a prefix of said mappings that consist of n equality-bound mappings and stops either
+     * at an inequality bound parameter or before a unbound parameter.
+     * @param matchInfo match info
+     * @return a map containing parameter to comparison range mappings for a prefix of parameters that is compatible
+     *         with a physical scan over the materialized view (of the candidate)
+     */
+    default Map<CorrelationIdentifier, ComparisonRange> computeBoundParameterPrefixMap(@Nonnull final MatchInfo matchInfo) {
+        final var prefixMap = Maps.<CorrelationIdentifier, ComparisonRange>newHashMap();
+        final var parameterBindingMap =
+                matchInfo.getRegularMatchInfo().getParameterBindingMap();
+
+        final var parameters = getSargableAliases();
+        for (final var parameter : parameters) {
+            Objects.requireNonNull(parameter);
+            @Nullable final var comparisonRange = parameterBindingMap.get(parameter);
+            if (comparisonRange == null) {
+                return ImmutableMap.copyOf(prefixMap);
+            }
+            if (prefixMap.containsKey(parameter)) {
+                Verify.verify(prefixMap.get(parameter).equals(comparisonRange));
+                continue;
+            }
+
+            switch (comparisonRange.getRangeType()) {
+                case EQUALITY:
+                    prefixMap.put(parameter, comparisonRange);
+                    break;
+                case INEQUALITY:
+                    prefixMap.put(parameter, comparisonRange);
+                    return ImmutableMap.copyOf(prefixMap);
+                case EMPTY:
+                default:
+                    return ImmutableMap.copyOf(prefixMap);
+            }
+        }
+
+        return ImmutableMap.copyOf(prefixMap);
+    }
+
+    /**
+     * Compute a list of {@link MatchedOrderingPart}s which forms a bridge to relate {@link KeyExpression}s and
+     * {@link QueryPredicate}s.
+     * @param matchInfo a pre-existing match info structure
+     * @param sortParameterIds the parameter IDs which the query should be ordered by
+     * @param isReverse reversed-ness of the order
+     * @return a list of bound key parts that express the order of the outgoing data stream and their respective mappings
+     *         between query and match candidate
+     */
+    @Nonnull
+    List<MatchedOrderingPart> computeMatchedOrderingParts(@Nonnull MatchInfo matchInfo,
+                                                          @Nonnull List<CorrelationIdentifier> sortParameterIds,
+                                                          boolean isReverse);
+
+    /**
+     * Computes a set of {@link MatchedOrderingPart}s representing ordering keys that are implicitly equality-bound
+     * by the candidate itself, rather than by explicit predicates in the query. These parts are prepended to the
+     * matched ordering and take priority over regular matched ordering parts.
+     * <p>
+     * For example, a {@link PrimaryScanMatchCandidate} scoped to a single record type returns an equality-bound
+     * ordering part for the record type key, since the scan is inherently constrained to that type.
+     * <p>
+     * The default implementation returns an empty set, meaning no implicit equality-bound ordering parts exist.
+     *
+     * @return a set of ordering parts that are implicitly equality-bound by this candidate
+     */
+    @Nonnull
+    default Set<MatchedOrderingPart> computeEqualityBoundImplicitOrderingParts() {
+        return ImmutableSet.of();
+    }
+
+    /**
+     * Returns whether this match candidate is inherently constrained to a single record type. This is true when
+     * the candidate queries exactly one record type, or when the record type key is part of the index definition
+     * and effectively partitions the index by type.
+     * <p>
+     * This is used by {@link #computeEqualityBoundImplicitOrderingParts()} to determine whether a record type key
+     * equality-bound ordering part should be implicitly added.
+     * <p>
+     * The default implementation returns {@code false}. Subclasses that support record-type-scoped scans
+     * (e.g., {@link ValueIndexScanMatchCandidate}, {@link WindowedIndexScanMatchCandidate}) override this.
+     *
+     * @return {@code true} if this candidate is scoped to a single record type, {@code false} otherwise
+     */
+    default boolean isScopedToSingleType() {
+        return false;
+    }
+
+    @Nonnull
+    Ordering computeOrderingFromScanComparisons(@Nonnull ScanComparisons scanComparisons,
+                                                boolean isReverse,
+                                                boolean isDistinct);
+
+    @Nullable
+    default PullUp.UnificationPullUp prepareForUnification(@Nonnull final PartialMatch partialMatch,
+                                                           @Nonnull final CorrelationIdentifier topAlias,
+                                                           @Nonnull final CorrelationIdentifier topCandidateAlias) {
+        return null;
+    }
+
+    /**
+     * Creates a {@link RecordQueryPlan} that represents a scan over the materialized candidate data.
+     * @param partialMatch the match to be used
+     * @param planContext the plan context
+     * @param memoizer the memoizer
+     * @param reverseScanOrder {@code true} if and only if a reverse scan is to be built
+     * @return a new {@link RecordQueryPlan}
+     */
+    @SuppressWarnings("java:S135")
+    default RecordQueryPlan toEquivalentPlan(@Nonnull final PartialMatch partialMatch,
+                                             @Nonnull final PlanContext planContext,
+                                             @Nonnull final Memoizer memoizer,
+                                             final boolean reverseScanOrder) {
+        final var matchInfo = partialMatch.getMatchInfo();
+        final var prefixMap = computeBoundParameterPrefixMap(matchInfo);
+
+        final var comparisonRangesForScanBuilder = ImmutableList.<ComparisonRange>builder();
+
+        // iterate through the parameters in order -- stop:
+        // 1. if the current mapping does not exist
+        // 2. the current mapping is EMPTY
+        // 3. after the current mapping if the mapping is an INEQUALITY
+        for (final var parameterAlias : getSargableAliases()) {
+            // get the mapped side
+            if (!prefixMap.containsKey(parameterAlias)) {
+                break;
+            }
+            comparisonRangesForScanBuilder.add(prefixMap.get(parameterAlias));
+        }
+
+        return toEquivalentPlan(partialMatch, planContext, memoizer, comparisonRangesForScanBuilder.build(), reverseScanOrder);
+    }
+
+    /**
+     * Creates a {@link RecordQueryPlan} that represents a scan over the materialized candidate data. This method is
+     * expected to be implemented by specific implementations of {@link MatchCandidate}.
+     * @param partialMatch the {@link PartialMatch} that matched the query and the candidate
+     * @param planContext the plan context
+     * @param memoizer the memoizer
+     * @param comparisonRanges a {@link List} of {@link ComparisonRange}s to be applied
+     * @param reverseScanOrder {@code true} if and only if a reverse scan is to be built
+     * @return a new {@link RecordQueryPlan}
+     */
+    @Nonnull
+    RecordQueryPlan toEquivalentPlan(@Nonnull PartialMatch partialMatch,
+                                     @Nonnull PlanContext planContext,
+                                     @Nonnull Memoizer memoizer,
+                                     @Nonnull List<ComparisonRange> comparisonRanges,
+                                     boolean reverseScanOrder);
+
+    @Nonnull
+    @SuppressWarnings("java:S1452")
+    default SetMultimap<Reference, RelationalExpression> findReferencingExpressions(@Nonnull final ImmutableList<? extends Reference> references) {
+        final var traversal = getTraversal();
+
+        final var refToExpressionMap =
+                Multimaps.<Reference, RelationalExpression>newSetMultimap(new LinkedIdentityMap<>(), LinkedIdentitySet::new);
+
+        // going up may yield duplicates -- deduplicate with this multimap
+        for (final Reference rangesOverRef : references) {
+            final var partialMatchesForCandidate = rangesOverRef.getPartialMatchesForCandidate(this);
+            for (final var partialMatch : partialMatchesForCandidate) {
+                for (final var parentReferencePath : traversal.getParentRefPaths(partialMatch.getCandidateRef())) {
+                    refToExpressionMap.put(parentReferencePath.getReference(), parentReferencePath.getExpression());
+                }
+            }
+        }
+        return refToExpressionMap;
+    }
+
+    @Nonnull
+    List<RecordType> getQueriedRecordTypes();
+
+    int getColumnSize();
+
+    boolean isUnique();
+
+    @Nonnull
+    default Set<String> getQueriedRecordTypeNames() {
+        return getQueriedRecordTypes().stream()
+                .map(RecordType::getName)
+                .collect(ImmutableSet.toImmutableSet());
+    }
+
+    default boolean hasAndOrderedByRecordTypeKey() {
+        return false;
+    }
+
+    @Nonnull
+    static Optional<List<Value>> computePrimaryKeyValuesMaybe(@Nullable KeyExpression primaryKey, @Nonnull Type flowedType) {
+        if (primaryKey == null) {
+            return Optional.empty();
+        }
+
+        return Optional.of(ScalarTranslationVisitor.translateKeyExpression(primaryKey, flowedType));
+    }
+
+    @Nonnull
+    @SuppressWarnings("PMD.CompareObjectsWithEquals")
+    static Optional<NonnullPair<Value, Comparisons.Comparison>> simplifyComparisonMaybe(@Nonnull final Value value,
+                                                                                        @Nonnull final Comparisons.Comparison comparison) {
+        final var providedOrderingPart =
+                value.deriveOrderingPart(EvaluationContext.empty(), AliasMap.emptyMap(), ImmutableSet.of(),
+                        OrderingPart.ProvidedOrderingPart::new, OrderingValueComputationRuleSet.usingProvidedOrderingParts());
+        final var simplifiedValue = providedOrderingPart.getValue();
+
+        if (simplifiedValue == value) {
+            return Optional.of(NonnullPair.of(value, comparison));
+        } else {
+            final var compensationPairOptional =
+                    simplifiedValue.matchAndCompensateComparisonMaybe(value, ValueEquivalence.empty());
+            if (compensationPairOptional.isEmpty()) {
+                return Optional.empty();
+            }
+            final var compensationPair = compensationPairOptional.get();
+            if (!(comparison instanceof Comparisons.ValueComparison)) {
+                return Optional.empty();
+            }
+            final var valueComparison = (Comparisons.ValueComparison)comparison;
+            final var comparedValue = valueComparison.getValue();
+            final var simplifiedComparedValueOptional = compensationPair.getLeft().unapplyMaybe(comparedValue);
+            if (simplifiedComparedValueOptional.isEmpty()) {
+                return Optional.empty();
+            }
+            final var simplifiedComparison =
+                    valueComparison.withValue(simplifiedComparedValueOptional.get());
+            return Optional.of(NonnullPair.of(simplifiedValue, simplifiedComparison));
+        }
+    }
+}

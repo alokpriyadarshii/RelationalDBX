@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<!DOCTYPE suppressions PUBLIC
+    "-//Puppy Crawl//DTD Suppressions 1.1//EN"
+    "http://www.puppycrawl.com/dtds/suppressions_1_1.dtd">
+
+<suppressions>
+    <suppress checks=".*"
+        files=".*[\\/]protogen[\\/].*"/>
+    <suppress checks=".*"
+              files=".*[\\/]generated-src[\\/].*"/>
+    <suppress checks="JavadocPackage"
+        files=".*[\\/]test[\\/].*|.*[\\/]java-proto[23][\\/].*[\\/]metadata[\\/].*"/>
+    <suppress checks="Header"
+        files=".*[\\/]org[\\/]apache[\\/]lucene[\\/]codecs[\\/]lucene84[\\/]LuceneOptimizedPostingsReader.java"/>
+    <suppress checks=".*"
+              files=".*[\\/]generated[\\/].*"/>
+    <suppress checks="Header"
+              files=".*[\\/]com[\\/]google[\\/]common[\\/]graph[\\/].*"/>
+    <suppress checks="Header"
+              files=".*[\\/]com[\\/]apple[\\/]foundationdb[\\/]half[\\/].*"/>
+</suppressions>

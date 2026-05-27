@@ -1,0 +1,380 @@
+/*
+ * yaml-tests.gradle
+ *
+ * This source file is part of the FoundationDB open source project
+ *
+ * Copyright 2015-2024 Apple Inc. and the FoundationDB project authors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+import java.util.concurrent.ThreadLocalRandom
+import java.util.jar.JarFile
+import java.util.regex.Matcher
+
+apply from: rootProject.file('gradle/proto.gradle')
+
+project.tasks.named("processResources") {
+    duplicatesStrategy = DuplicatesStrategy.INCLUDE
+}
+
+project.tasks.named("processTestResources") {
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
+
+tasks.named("sourcesJar") {
+    duplicatesStrategy = 'include'
+    // classifier('sources')
+    from sourceSets.main.allSource
+}
+
+apply from: rootProject.file('gradle/publishing.gradle')
+
+def coreProject = ":${ext.coreProjectName}"
+dependencies {
+    implementation project(coreProject)
+    implementation project(":relationaldbx-debugger")
+    implementation project(":relationaldbx-relational-api")
+    implementation project(":relationaldbx-relational-core")
+    implementation project(":relationaldbx-relational-jdbc")
+    implementation project(":relationaldbx-relational-server")
+    implementation(libs.jline)
+    implementation(libs.asciitable)
+    implementation(libs.jsr305)
+    implementation(libs.junit.api)
+    implementation(libs.junit.params)
+    implementation(libs.junit.platform)
+    implementation(libs.log4j.api)
+    implementation(libs.gson)
+    implementation(libs.guava)
+    implementation(libs.protobuf)
+    implementation(libs.protobuf.util)
+    implementation(libs.snakeyaml)
+    implementation(project(':relationaldbx-test-utils'))
+    implementation(libs.jcommander)
+
+    testImplementation(libs.bundles.test.impl)
+    testRuntimeOnly(libs.bundles.test.runtime)
+    testCompileOnly(libs.bundles.test.compileOnly)
+    testImplementation project(":relationaldbx-relational-server")
+    testImplementation project(":relationaldbx-relational-jdbc")
+    testImplementation project(path: ":relationaldbx-debugger", configuration: 'tests')
+    implementation(libs.diffutils)
+    compileOnly(libs.autoService)
+    annotationProcessor(libs.autoService)
+}
+
+// This "method" resolves the latest shadowJar version of the relational-server, and returns the file reference to it
+// which can be used in `Copy` tasks.
+ext.resolveOtherServer = { Set<String> rejectedVersions ->
+    def configurationName = "resolveArtifact-${UUID.randomUUID()}"
+    return rootProject.with {
+        configurations.create(configurationName, {
+        resolutionStrategy {
+                // Cache the latest version for 10 minutes to make sure we actually get the latest.
+                // This should be long enough that we can do this resolution, but means that if we had a release
+                // in the last 10 minutes.
+                // Note: In the actions we have a build cache, which means that these versions will be cached across
+                // builds.
+                // The default value for this is 24 hours, which is probably, generally, fine, but in the case where
+                // we do have two releases within 24 hours (as we did for 4.2.3.0) we don't want to miss the last
+                // version.
+                cacheDynamicVersionsFor 10, 'minutes'
+            }
+        })
+        // If you're wondering why this doesn't just use `latest.release`:
+        // `latest.release` becomes `LatestVersionSelector` which `requiresMetadata` in order to determine if the
+        // version in question is a release. This means that it can't just look at the version listing, it has to
+        // download all of them, and reject them. This adds a frustrating amount of time to the build.
+        // Instead we specify `+` which does not require the metadata, and then reject a list of versions.
+        // Every time we get a version that has `-SNAPSHOT` we add it to the `rejectedVersions` list, and recurse
+        // until we find a version that doesn't have a `-SNAPSHOT`, and that's what we use.
+        dependencies.add(configurationName,
+                // the `all` classifier specifies that we want to fetch the shadow jar, which includes all the
+                // dependencies. The empty version slot is filled in by the `version { strictly '+' }` Action below.
+                'org.foundationdb:relationaldbx-relational-server::all',
+                {
+                    version {
+                        strictly '+'
+                        if (rejectedVersions.size() > 0) {
+                            reject rejectedVersions.toArray(new String[0])
+                        }
+                    }
+                    // we don't want to take in any transitive dependencies.
+                    // There shouldn't be any external dependencies, but commenting this out, this fails with a missing
+                    // grpc dependency.
+                    transitive=false
+                })
+        def configuration = configurations.getByName(configurationName, { })
+
+        File resolution = configuration.resolve()[0]
+        Matcher versionMatch = resolution.getName() =~ /^relationaldbx-relational-server-(.*-SNAPSHOT)-all.jar$/
+        if (versionMatch.size() != 0) {
+            println("Rejecting old external server: " + resolution.getName())
+            def version = versionMatch[0][1]
+            // check that the version is new, to more obviously catch potential infinite loops
+            assert rejectedVersions.add(version)
+            return resolveOtherServer(rejectedVersions)
+        }
+        println("Downloaded old external server: " + resolution.getName())
+        return resolution
+    }
+}
+
+static def getAttributesFromJar(File file) {
+    try (JarFile jarFile = new JarFile(file)) {
+        java.util.jar.Manifest manifest = jarFile.getManifest()
+        java.util.jar.Attributes mainAttributes = manifest.getMainAttributes()
+        String version = mainAttributes.getValue("Specification-Version")
+        // It looks like `Build-Date` is not currently being included, if we had that we could guarantee the last
+        // x weeks of builds. There may need to be some ways to handle the fact that built date may not be consistent
+        // with the ordering of the versions
+        if (version != null) {
+            return [version: version]
+        } else {
+            throw new RuntimeException("Server does not specify a version in the manifest: " + file.getAbsolutePath())
+        }
+    }
+}
+
+ext.resolveManyServers = { ->
+    Set<File> selectedServers = new HashSet<>();
+    Set<String> rejectedVersions = new HashSet<>();
+    while (selectedServers.size() < 10) {
+        def serverFile = resolveOtherServer(rejectedVersions)
+        def attributes = getAttributesFromJar(serverFile)
+        rejectedVersions.add(attributes.version)
+        selectedServers.add(serverFile)
+    }
+    println("Found ${selectedServers.size()} to test against")
+    return selectedServers
+}
+
+// Resolves a specific version of the relational-server by exact version string.
+ext.resolveSpecificServer = { String version ->
+    def configurationName = "resolveArtifact-specific-${UUID.randomUUID()}"
+    return rootProject.with {
+        configurations.create(configurationName, {
+            resolutionStrategy {
+                cacheDynamicVersionsFor 10, 'minutes'
+            }
+        })
+        dependencies.add(configurationName,
+                'org.foundationdb:relationaldbx-relational-server::all',
+                {
+                    it.version {
+                        strictly version
+                    }
+                    transitive = false
+                })
+        def configuration = configurations.getByName(configurationName, { })
+        File resolution = configuration.resolve()[0]
+        println("Downloaded specific external server: " + resolution.getName())
+        return resolution
+    }
+}
+
+// Resolves the n most-recent released version strings in descending order (most recent first).
+ext.resolveRecentVersionStrings = { int n ->
+    List<String> resolvedVersions = new ArrayList<>()
+    Set<String> rejectedVersions = new HashSet<>()
+    while (resolvedVersions.size() < n) {
+        def serverFile = resolveOtherServer(rejectedVersions)
+        def attributes = getAttributesFromJar(serverFile)
+        rejectedVersions.add(attributes.version)
+        resolvedVersions.add(attributes.version)
+    }
+    return resolvedVersions
+}
+
+task cleanExternalServerDirectory(type: Delete) {
+    delete project.layout.buildDirectory.dir('externalServer')
+}
+
+task serverJars(type: Copy) {
+    dependsOn ":relationaldbx-relational-server:package", "cleanExternalServerDirectory"
+    into project.layout.buildDirectory.dir('externalServer')
+    from { resolveOtherServer(["4.2.3.0", "4.2.4.0"].toSet()) }
+    from (rootProject.project("relationaldbx-relational-server").layout.files('.dist')) {
+        include("relationaldbx-relational-server-${rootProject.version}-all.jar")
+    }
+}
+
+task downloadManyExternalServers(type: Copy) {
+    dependsOn "cleanExternalServerDirectory"
+    from { resolveManyServers() }
+    into project.layout.buildDirectory.dir('externalServer')
+}
+
+// Resolves the n most-recent released version strings and writes them to a file, comma-separated.
+// n defaults to 10 and can be overridden with -Ptests.listVersionsCount=<n>.
+// Output file: <buildDir>/recentVersions.txt
+task listRecentVersions {
+    def listVersionsCountProvider = providers.gradleProperty('tests.listVersionsCount')
+    def outputFileProvider = layout.buildDirectory.file('recentVersions.txt')
+    doLast {
+        int count = listVersionsCountProvider.map { Integer.parseInt(it) }.getOrElse(10)
+        def versions = resolveRecentVersionStrings(count)
+        // we don't want the output to be a declared output, otherwise gradle will conclude that it doesn't need to
+        // rerun this when the property changes.
+        def outputFile = outputFileProvider.get().asFile
+        outputFile.parentFile.mkdirs()
+        String jsonArray = '["' + versions.join('", "') + '"]'
+        outputFile.text = "versions=" + jsonArray
+        println("Recent versions: " + jsonArray)
+    }
+}
+
+// Downloads exactly one external server version for running mixedModeTest against a
+// single version.  The version is chosen by the following property:
+//
+//   -Ptests.mixedModeVersion=4.10.3.0
+//
+task downloadSpecificExternalServer(type: Copy) {
+    dependsOn "cleanExternalServerDirectory"
+    into project.layout.buildDirectory.dir('externalServer')
+    def mixedModeVersionProvider = providers.gradleProperty('tests.mixedModeVersion')
+    // Resolve which JAR to download only when the task is actually executed.
+    // Using from(Callable) defers evaluation to execution time, which avoids
+    // failing at configuration time when neither property is set and this task
+    // is not part of the requested task graph.
+    from({
+        def exactVersion = mixedModeVersionProvider.orNull
+        if (exactVersion != null) {
+            println("Using explicitly specified external server version: ${exactVersion}")
+            return resolveSpecificServer(exactVersion)
+        } else {
+            throw new GradleException(
+                "downloadSpecificExternalServer requires either -Ptests.mixedModeVersion=<version> ")
+        }
+    })
+}
+
+mixedModeTest {
+    if (project.hasProperty('tests.mixedModeVersion')) {
+        dependsOn("downloadSpecificExternalServer")
+    } else {
+        dependsOn("downloadManyExternalServers")
+    }
+    systemProperty("yaml_testing_external_server", project.layout.buildDirectory.dir('externalServer').get().asFile)
+}
+
+singleVersionTest {
+    dependsOn("downloadManyExternalServers")
+    systemProperty("yaml_testing_external_server", project.layout.buildDirectory.dir('externalServer').get().asFile)
+}
+
+test {
+    dependsOn "serverJars"
+    systemProperty("yaml_testing_external_server", project.layout.buildDirectory.dir('externalServer').get().asFile)
+    def seed
+    if (project.hasProperty('tests.yaml.seed')) {
+        seed = Long.parseLong(project.getProperty('tests.yaml.seed'))
+    } else {
+        seed = ThreadLocalRandom.current().nextLong();
+    }
+    println("Using seed for yaml-tests: ${seed}")
+    systemProperty('tests.yaml.seed', seed)
+    if (project.hasProperty('tests.yaml.iterations')) {
+        systemProperties['tests.yaml.iterations'] = project.getProperty('tests.yaml.iterations')
+    } else if (project.hasProperty('tests.iterations')) {
+        // The yaml tests are quite fast now, lets put a lot more repetition on the queries, if it gets larger
+        // we may want to decrease this multiplying factor.
+        systemProperties['tests.yaml.iterations'] = Integer.parseInt(project.getProperty('tests.iterations')) * 20
+    }
+}
+
+def copyTempLogs = tasks.register("copyTempLogs", Copy) {
+    from(".out/")
+    include "tmp-*/*.log"
+    into(".out/reports/logs")
+    eachFile {
+        it.path = it.path.replaceFirst("tmp-", "")
+    }
+    setIncludeEmptyDirs(false)
+}
+
+tasks.withType(Test).configureEach {
+    if (project.hasProperty("tests.ci") || project.hasProperty("tests.saveServerLogs")) {
+        systemProperties['tests.saveServerLogs'] = "true"
+        finalizedBy(copyTempLogs)
+    }
+}
+
+tasks.register('runDebug', JavaExec) {
+    environment rootProject.ext.fdbEnvironment
+    mainClass = 'com.apple.foundationdb.record.query.plan.cascades.debug.ReplRunner'
+    classpath = sourceSets.test.runtimeClasspath
+    standardInput = System.in
+    standardOutput = System.out
+
+    // Optional: key-value argument handling
+    if (project.hasProperty('debugArgs')) {
+        def rawArgs = project.debugArgs.split(',')
+        def formattedArgs = rawArgs.collect { "--${it.trim()}" }
+        args formattedArgs
+    }
+
+    // Make this task depend on the same things as 'test'
+    dependsOn tasks.test.taskDependencies.getDependencies(tasks.test)
+    systemProperty("yaml_testing_external_server", project.layout.buildDirectory.dir('externalServer').get().asFile)
+    systemProperty("tests.runQuick", "true")
+}
+
+tasks.register('analyzeMetrics', JavaExec) {
+    description = 'Analyze metrics differences between git references'
+    group = 'verification'
+
+    mainClass = 'com.apple.foundationdb.relational.yamltests.MetricsDiffAnalyzer'
+    classpath = sourceSets.main.runtimeClasspath
+
+    // Pass along arguments to metrics analysis
+    args = []
+    if (project.hasProperty('metricsAnalysis.baseRef')) {
+        args += ['--base-ref', project.getProperty('metricsAnalysis.baseRef')]
+    }
+    if (project.hasProperty('metricsAnalysis.headRef')) {
+        args += ['--head-ref', project.getProperty('metricsAnalysis.headRef')]
+    }
+    if (project.hasProperty('metricsAnalysis.urlBase')) {
+        args += ['--url-base', project.getProperty('metricsAnalysis.urlBase')]
+    }
+    if (project.hasProperty('metricsAnalysis.output')) {
+        args += ['--output', project.getProperty('metricsAnalysis.output')]
+    }
+    if (project.hasProperty('metricsAnalysis.outlierQueries')) {
+        args += ['--outlier-queries', project.getProperty('metricsAnalysis.outlierQueries')]
+    }
+    args += ['--repository-root']
+    if (project.hasProperty('metricsAnalysis.repositoryRoot')) {
+        args += [project.getProperty('metricsAnalysis.repositoryRoot')]
+    } else {
+        args += [rootProject.projectDir.toString()]
+    }
+
+    // Make sure classes are built first
+    dependsOn classes
+    doFirst {
+        logger.info("Running metrics analysis with args: ${args}")
+    }
+}
+
+publishing {
+    publications {
+        library(MavenPublication) {
+            pom {
+                description = 'Tests of the Relational project driven off of YAML specifications.'
+            }
+        }
+    }
+}

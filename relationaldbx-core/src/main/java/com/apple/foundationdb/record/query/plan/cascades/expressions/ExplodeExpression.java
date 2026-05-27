@@ -1,0 +1,237 @@
+/*
+ * ExplodeExpression.java
+ *
+ * This source file is part of the FoundationDB open source project
+ *
+ * Copyright 2015-2020 Apple Inc. and the FoundationDB project authors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package com.apple.foundationdb.record.query.plan.cascades.expressions;
+
+import com.apple.foundationdb.annotation.API;
+import com.apple.foundationdb.record.EvaluationContext;
+import com.apple.foundationdb.record.query.plan.cascades.AliasMap;
+import com.apple.foundationdb.record.query.plan.cascades.ComparisonRange;
+import com.apple.foundationdb.record.query.plan.cascades.Compensation;
+import com.apple.foundationdb.record.query.plan.cascades.CorrelationIdentifier;
+import com.apple.foundationdb.record.query.plan.cascades.IdentityBiMap;
+import com.apple.foundationdb.record.query.plan.cascades.MatchInfo;
+import com.apple.foundationdb.record.query.plan.cascades.PartialMatch;
+import com.apple.foundationdb.record.query.plan.cascades.Quantifier;
+import com.apple.foundationdb.record.query.plan.cascades.explain.InternalPlannerGraphRewritable;
+import com.apple.foundationdb.record.query.plan.cascades.explain.PlannerGraph;
+import com.apple.foundationdb.record.query.plan.cascades.typing.Type;
+import com.apple.foundationdb.record.query.plan.cascades.values.FieldValue;
+import com.apple.foundationdb.record.query.plan.cascades.values.QueriedValue;
+import com.apple.foundationdb.record.query.plan.cascades.values.Value;
+import com.apple.foundationdb.record.query.plan.cascades.values.translation.PullUp;
+import com.apple.foundationdb.record.query.plan.cascades.values.translation.TranslationMap;
+import com.google.common.base.Verify;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
+
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+
+/**
+ * A table function expression that “explodes” a repeated field into a stream of its values.
+ *
+ * <p>In the {@code WITH ORDINALITY} variant, it also generates 1-based ordinals of the field values. In this case it
+ * produces a struct with two anonymous fields—the element and the ordinal—instead of the bare element.
+ */
+@API(API.Status.EXPERIMENTAL)
+public class ExplodeExpression extends AbstractRelationalExpressionWithoutChildren implements InternalPlannerGraphRewritable {
+    @Nonnull
+    private final Value collectionValue;
+
+    /**
+     * Whether ordinals should be produced alongside the array elements.
+     */
+    private final boolean withOrdinality;
+
+    /**
+     * The element type of the collection value.
+     */
+    @Nonnull
+    private final Type elementType;
+
+    /**
+     * The type of the explode result.
+     */
+    @Nonnull
+    private final Type explodeResultType;
+
+    public ExplodeExpression(@Nonnull final Value collectionValue, final boolean withOrdinality) {
+        this.collectionValue = collectionValue;
+        this.withOrdinality = withOrdinality;
+        Verify.verify(collectionValue.getResultType().isArray());
+        this.elementType = Objects.requireNonNull(((Type.Array)collectionValue.getResultType()).getElementType());
+        this.explodeResultType = explodeResultType(elementType, withOrdinality);
+    }
+
+    public ExplodeExpression(@Nonnull final Value collectionValue) {
+        this(collectionValue, false);
+    }
+
+    /**
+     * Returns the element type of the collection value.
+     */
+    @Nonnull
+    public Type getElementType() {
+        return elementType;
+    }
+
+    /**
+     * Returns the type of the explode result. For the {@code WITH ORDINALITY} variant, builds an anonymous-field
+     * struct result type holding the element and the 1-based ordinal.
+     */
+    @Nonnull
+    public static Type explodeResultType(@Nonnull final Type elementType, boolean withOrdinality) {
+        if (withOrdinality) {
+            return Type.Record.fromFields(ImmutableList.of(
+                    Type.Record.Field.of(elementType, Optional.empty()),
+                    Type.Record.Field.of(Type.primitiveType(Type.TypeCode.INT, false), Optional.empty())));
+        } else {
+            return elementType;
+        }
+    }
+
+    /**
+     * Returns the type of the explode result.
+     */
+    @Nonnull
+    public Type getExplodeResultType() {
+        return explodeResultType;
+    }
+
+    @Nonnull
+    @Override
+    public Value getResultValue() {
+        return new QueriedValue(getExplodeResultType());
+    }
+
+    @Nonnull
+    public Value getCollectionValue() {
+        return collectionValue;
+    }
+
+    public boolean isWithOrdinality() {
+        return withOrdinality;
+    }
+
+    @Nonnull
+    @Override
+    public List<? extends Quantifier> getQuantifiers() {
+        return Collections.emptyList();
+    }
+
+    @Nonnull
+    @Override
+    public Set<CorrelationIdentifier> computeCorrelatedToWithoutChildren() {
+        return collectionValue.getCorrelatedTo();
+    }
+
+    @Override
+    @SuppressWarnings("PMD.CompareObjectsWithEquals")
+    public boolean equalsWithoutChildren(@Nonnull RelationalExpression otherExpression,
+                                         @Nonnull final AliasMap equivalencesMap) {
+        if (this == otherExpression) {
+            return true;
+        }
+        if (otherExpression instanceof final ExplodeExpression other) {
+            return collectionValue.semanticEquals(other.getCollectionValue(), equivalencesMap) &&
+                    isWithOrdinality() == other.isWithOrdinality() &&
+                    semanticEqualsForResults(otherExpression, equivalencesMap);
+        }
+        return false;
+    }
+
+    @Override
+    public int computeHashCodeWithoutChildren() {
+        // Note: This is written in a way that preserves pre-existing hashes for `withOrdinality=false`.
+        return withOrdinality
+               ? Objects.hash(collectionValue, true)
+               : Objects.hash(collectionValue);
+    }
+
+    @Nonnull
+    @Override
+    @SuppressWarnings("PMD.CompareObjectsWithEquals")
+    public ExplodeExpression translateCorrelations(@Nonnull final TranslationMap translationMap,
+                                                   final boolean shouldSimplifyValues,
+                                                   @Nonnull final List<? extends Quantifier> translatedQuantifiers) {
+        Verify.verify(translatedQuantifiers.isEmpty());
+        final Value translatedCollectionValue =
+                collectionValue.translateCorrelations(translationMap, shouldSimplifyValues);
+        // this is ok since there are no new quantifiers
+        if (translatedCollectionValue != collectionValue) {
+            return new ExplodeExpression(translatedCollectionValue, withOrdinality);
+        }
+        return this;
+    }
+
+    @Nonnull
+    @Override
+    public Iterable<MatchInfo> subsumedBy(@Nonnull final RelationalExpression candidateExpression,
+                                          @Nonnull final AliasMap bindingAliasMap,
+                                          @Nonnull final IdentityBiMap<Quantifier, PartialMatch> partialMatchMap,
+                                          @Nonnull final EvaluationContext evaluationContext) {
+        if (!isCompatiblyAndCompletelyBound(bindingAliasMap, candidateExpression.getQuantifiers())) {
+            return ImmutableList.of();
+        }
+
+        return exactlySubsumedBy(candidateExpression, bindingAliasMap, partialMatchMap, TranslationMap.empty());
+    }
+
+    @Nonnull
+    @Override
+    public Compensation compensate(@Nonnull final PartialMatch partialMatch,
+                                   @Nonnull final Map<CorrelationIdentifier, ComparisonRange> boundParameterPrefixMap,
+                                   @Nullable final PullUp pullUp,
+                                   @Nonnull final CorrelationIdentifier candidateAlias) {
+        // subsumedBy() is based on equality and this expression is always a leaf, thus we return empty here as
+        // if there is a match, it's exact
+        return Compensation.noCompensation();
+    }
+
+    @Nonnull
+    @Override
+    public PlannerGraph rewriteInternalPlannerGraph(@Nonnull final List<? extends PlannerGraph> childGraphs) {
+        return PlannerGraph.fromNodeAndChildGraphs(
+                new PlannerGraph.LogicalOperatorNode(this,
+                        "Explode",
+                        ImmutableList.of(toString()),
+                        ImmutableMap.of()),
+                childGraphs);
+    }
+
+    @Override
+    public String toString() {
+        return withOrdinality
+               ? collectionValue + " WITH ORDINALITY"
+               : collectionValue.toString();
+    }
+
+    public static ExplodeExpression explodeField(@Nonnull final Quantifier.ForEach baseQuantifier,
+                                                 @Nonnull final List<String> fieldNames) {
+        return new ExplodeExpression(FieldValue.ofFieldNames(baseQuantifier.getFlowedObjectValue(), fieldNames));
+    }
+}

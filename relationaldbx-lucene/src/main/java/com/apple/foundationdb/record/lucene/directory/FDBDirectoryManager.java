@@ -1,0 +1,551 @@
+/*
+ * FDBDirectoryManager.java
+ *
+ * This source file is part of the FoundationDB open source project
+ *
+ * Copyright 2015-2022 Apple Inc. and the FoundationDB project authors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package com.apple.foundationdb.record.lucene.directory;
+
+import com.apple.foundationdb.KeyValue;
+import com.apple.foundationdb.Range;
+import com.apple.foundationdb.annotation.API;
+import com.apple.foundationdb.async.AsyncUtil;
+import com.apple.foundationdb.record.EndpointType;
+import com.apple.foundationdb.record.KeyRange;
+import com.apple.foundationdb.record.RecordCursor;
+import com.apple.foundationdb.record.ScanProperties;
+import com.apple.foundationdb.record.cursors.ChainedCursor;
+import com.apple.foundationdb.record.logging.KeyValueLogMessage;
+import com.apple.foundationdb.record.lucene.LuceneAnalyzerCombinationProvider;
+import com.apple.foundationdb.record.lucene.LuceneAnalyzerRegistryImpl;
+import com.apple.foundationdb.record.lucene.LuceneAnalyzerType;
+import com.apple.foundationdb.record.lucene.LuceneAnalyzerWrapper;
+import com.apple.foundationdb.record.lucene.LuceneExceptions;
+import com.apple.foundationdb.record.lucene.LuceneIndexExpressions;
+import com.apple.foundationdb.record.lucene.LuceneIndexTypes;
+import com.apple.foundationdb.record.lucene.LuceneLogMessageKeys;
+import com.apple.foundationdb.record.lucene.LucenePartitionInfoProto;
+import com.apple.foundationdb.record.lucene.LucenePartitioner;
+import com.apple.foundationdb.record.lucene.LuceneRecordContextProperties;
+import com.apple.foundationdb.record.metadata.expressions.GroupingKeyExpression;
+import com.apple.foundationdb.record.metadata.expressions.KeyExpression;
+import com.apple.foundationdb.record.provider.foundationdb.FDBRecordContext;
+import com.apple.foundationdb.record.provider.foundationdb.FDBRecordContextConfig;
+import com.apple.foundationdb.record.provider.foundationdb.FDBTransactionPriority;
+import com.apple.foundationdb.record.provider.foundationdb.IndexDeferredMaintenanceControl;
+import com.apple.foundationdb.record.provider.foundationdb.IndexMaintainerState;
+import com.apple.foundationdb.record.provider.foundationdb.KeyValueCursor;
+import com.apple.foundationdb.subspace.Subspace;
+import com.apple.foundationdb.tuple.Tuple;
+import com.apple.foundationdb.tuple.TupleHelpers;
+import com.apple.foundationdb.util.CallbackUtils;
+import com.apple.foundationdb.util.CloseableUtils;
+import com.google.common.annotations.VisibleForTesting;
+import org.apache.lucene.index.DirectoryReader;
+import org.apache.lucene.index.IndexReader;
+import org.apache.lucene.index.IndexWriter;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
+import java.io.IOException;
+import java.util.Collections;
+import java.util.IdentityHashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
+import java.util.stream.Collectors;
+
+/**
+ * A transaction-scoped manager of {@link FDBDirectory} objects. For a single transaction, all {@link FDBDirectory}
+ * objects should be created through this manager. This allows for cached data (like the block cache or file
+ * list cache) for a single directory to persist across different operations (e.g., different queries) conducted
+ * in the same transaction.
+ * <p>Note: Since the manager is transaction-scoped, it will be closed once the transaction commits or closes.
+ * (See the commit hook created below achieving this).
+ * When the manager is closed, it will also close all the directory wrappers it has created.</p>
+ */
+@API(API.Status.INTERNAL)
+public class FDBDirectoryManager implements AutoCloseable {
+    private static final Logger LOGGER = LoggerFactory.getLogger(FDBDirectoryManager.class);
+    @Nonnull
+    private final IndexMaintainerState state;
+    @Nonnull
+    private final Map<Tuple, FDBDirectoryWrapper> createdDirectories;
+    private final int mergeDirectoryCount;
+    @Nonnull
+    protected final LuceneAnalyzerWrapper writerAnalyzer;
+    @Nonnull
+    private final LuceneAnalyzerCombinationProvider analyzerSelector;
+    @Nullable
+    protected final Exception exceptionAtCreation;
+    private boolean closed = false;
+
+    protected FDBDirectoryManager(@Nonnull IndexMaintainerState state) {
+        this.state = state;
+        this.createdDirectories = new ConcurrentHashMap<>();
+        this.mergeDirectoryCount = getMergeDirectoryCount(state);
+        this.exceptionAtCreation = FDBTieredMergePolicy.usesCreationStack() ? new Exception() : null;
+        final var fieldInfos = LuceneIndexExpressions.getDocumentFieldDerivations(state.index, state.store.getRecordMetaData());
+        this.analyzerSelector = LuceneAnalyzerRegistryImpl.instance().getLuceneAnalyzerCombinationProvider(state.index, LuceneAnalyzerType.FULL_TEXT, fieldInfos);
+        this.writerAnalyzer = analyzerSelector.provideIndexAnalyzer();
+    }
+
+    @Override
+    @SuppressWarnings("PMD.CloseResource")
+    public synchronized void close() throws IOException {
+        // This is invoked through commitCheck therefore is expected to abort on failure
+        // and should not attempt to complete all calls
+        for (FDBDirectoryWrapper directory : createdDirectories.values()) {
+            directory.close();
+        }
+        createdDirectories.clear();
+    }
+
+    /**
+     * Close the directoryManager when the transaction wasn't committed.
+     * @throws IOException in case some directories failed to close
+     */
+    @SuppressWarnings("PMD.CloseResource")
+    public synchronized void closeWithoutCommit() throws IOException {
+        try {
+            List<Supplier<Void>> callbacks = createdDirectories.values().stream()
+                    .map(this::closeWithoutCommitCallback).collect(Collectors.toList());
+            // ensure we close all resources, regardless of exceptions
+            final CallbackUtils.InvokeResults<Void> results = CallbackUtils.invokeAll(callbacks);
+            if (results.getAccumulatedException() != null) {
+                throw LuceneExceptions.toIoException(results.getAccumulatedException(), null);
+            }
+        } finally {
+            createdDirectories.clear();
+        }
+    }
+
+    @Nonnull
+    public LuceneAnalyzerCombinationProvider getAnalyzerSelector() {
+        return analyzerSelector;
+    }
+
+    @SuppressWarnings("PMD.CloseResource")
+    public CompletableFuture<Void> mergeIndex(@Nonnull LucenePartitioner partitioner) {
+        // This function will iterate the grouping keys and explicitly merge each
+
+        final ScanProperties scanProperties = ScanProperties.FORWARD_SCAN.with(
+                props -> props.clearState().setReturnedRowLimit(1));
+
+        final Range range = state.indexSubspace.range();
+        final KeyRange keyRange = new KeyRange(range.begin, range.end);
+        final Subspace subspace = state.indexSubspace;
+        final KeyExpression rootExpression = state.index.getRootExpression();
+
+        // This agilityContext will be used to determine/iterate grouping keys and partitions. The time gap between calls might
+        // be too long for a non-agile context.
+        final AgilityContext agilityContext = getAgilityContext(true, false);
+
+        if (! (rootExpression instanceof GroupingKeyExpression)) {
+            // Here: empty grouping keys tuple
+            return mergeIndex(TupleHelpers.EMPTY, partitioner, agilityContext)
+                    .whenComplete((ignore, ex) -> closeOrAbortAgilityContext(agilityContext, ex));
+        }
+        // Here: iterate the grouping keys and merge each
+        GroupingKeyExpression expression = (GroupingKeyExpression) rootExpression;
+        final int groupingCount = expression.getGroupingCount();
+
+        final RecordCursor<Tuple> cursor = new ChainedCursor<>(
+                state.context,
+                lastKey -> agilityContext.apply(context -> nextTuple(context, subspace, keyRange, lastKey, scanProperties, groupingCount)),
+                Tuple::pack,
+                Tuple::fromBytes,
+                null,
+                ScanProperties.FORWARD_SCAN);
+
+        return cursor
+                .map(tuple ->
+                        Tuple.fromItems(tuple.getItems().subList(0, groupingCount)))
+                // Use a pipeline size of 1. We don't want to be merging multiple different groups at a time
+                // It may make sense in the future to make these concurrent, but there is enough complexity that it is
+                // better to avoid the concurrent merges.
+                // This also reduces the amount of load that a single store can cause on a system.
+                .forEachAsync(groupingKey -> mergeIndex(groupingKey, partitioner, agilityContext),
+                        1)
+                .whenComplete((ignore, ex) -> closeOrAbortAgilityContext(agilityContext, ex));
+    }
+
+    private CompletableFuture<Void> mergeIndex(Tuple groupingKey,
+                                               @Nonnull LucenePartitioner partitioner, final AgilityContext agileContext) {
+        // Note: We always flush before calls to `mergeIndexNow` because we won't come back to get the next partition
+        // or group until after the merge which could be many seconds later, in which case the current transaction would
+        // no longer be valid. It may make sense to have AgilityContext.Agile commit periodically regardless of activity
+        if (!partitioner.isPartitioningEnabled()) {
+            agileContext.flush();
+            return mergeIndexNow(groupingKey, null);
+        } else {
+            // Here: iterate the partition ids and merge each
+            AtomicReference<LucenePartitionInfoProto.LucenePartitionInfo> lastPartitionInfo = new AtomicReference<>();
+            return AsyncUtil.whileTrue(() -> getNextOlderPartitionInfo(groupingKey, agileContext, lastPartitionInfo)
+                    .thenCompose(partitionId -> {
+                        if (partitionId == null) {
+                            // partition list end
+                            return AsyncUtil.READY_FALSE;
+                        }
+                        agileContext.flush();
+                        return mergeIndexNow(groupingKey, partitionId)
+                                .thenApply(v -> true);
+                    }));
+        }
+    }
+
+    private CompletableFuture<Void> mergeIndexNow(Tuple groupingKey, @Nullable final Integer partitionId) {
+        final AgilityContext agilityContext = getAgilityContext(true, true);
+        RuntimeException mergeException = null;
+        try {
+            mergeIndexWithContext(groupingKey, partitionId, agilityContext);
+        } catch (RuntimeException e) {
+            mergeException = e;
+        }
+        // Here: drain this partition's queue and clear the "use queue" indicator
+        // If the merge had failed, we still wish to drain the queue and release the ongoing merge indicator. Merge can be retried by another process.
+        // If the merge failed due to a lock exception, skip draining — there is probably another ongoing merge process
+        final RuntimeException capturedMergeException = mergeException;
+        boolean skipDrain = hasCause(mergeException, FDBDirectoryLockFactory.FDBDirectoryLockException.class);
+        if (skipDrain && LOGGER.isInfoEnabled()) {
+            LOGGER.info(KeyValueLogMessage.of("Skipping drain pending queue due to lock exception",
+                    LuceneLogMessageKeys.GROUP, groupingKey,
+                    LuceneLogMessageKeys.INDEX_PARTITION, partitionId));
+        }
+        CompletableFuture<Void> drainFuture = skipDrain
+                ? AsyncUtil.DONE
+                : drainPendingQueue(groupingKey, partitionId, agilityContext);
+        return drainFuture
+                .whenComplete((v, drainEx) -> {
+                    // IndexWriter may release the file lock in a finally block in its own code, so if there is an error in its
+                    // code, we need to commit. We could optimize this a bit, and have it only flush if it has committed anything
+                    // but that should be rare.
+                    agilityContext.flushAndClose();
+                })
+                .thenRun(() -> {
+                    if (capturedMergeException != null) {
+                        throw capturedMergeException;
+                    }
+                });
+    }
+
+    public void mergeIndexWithContext(@Nonnull final Tuple groupingKey,
+                                      @Nullable final Integer partitionId,
+                                      @Nonnull final AgilityContext agilityContext) {
+        try (FDBDirectoryWrapper directoryWrapper = createDirectoryWrapper(groupingKey, partitionId, agilityContext)) {
+            try {
+                directoryWrapper.setOngoingMergeIndicator();
+                directoryWrapper.mergeIndex();
+                if (LOGGER.isDebugEnabled()) {
+                    LOGGER.debug(KeyValueLogMessage.of("Lucene merge success",
+                            LuceneLogMessageKeys.GROUP, groupingKey,
+                            LuceneLogMessageKeys.INDEX_PARTITION, partitionId));
+                }
+            } catch (IOException e) {
+                throw LuceneExceptions.toRecordCoreException("Lucene mergeIndex failed", e,
+                        LuceneLogMessageKeys.GROUP, groupingKey,
+                        LuceneLogMessageKeys.INDEX_PARTITION, partitionId);
+            }
+        } catch (IOException e) {
+            // there was an IOException closing the index writer
+            throw LuceneExceptions.toRecordCoreException("Lucene mergeIndex close failed", e,
+                    LuceneLogMessageKeys.GROUP, groupingKey,
+                    LuceneLogMessageKeys.INDEX_PARTITION, partitionId);
+        }
+    }
+
+    @SuppressWarnings("PMD.CloseResource")
+    public CompletableFuture<Void> drainPendingQueue(@Nonnull final Tuple groupingKey,
+                                                     @Nullable final Integer partitionId,
+                                                     @Nonnull final AgilityContext agilityContext) {
+        final FDBDirectoryWrapper directoryWrapper = createDirectoryWrapper(groupingKey, partitionId, agilityContext);
+        return directoryWrapper.drainPendingQueue(groupingKey, partitionId)
+                .whenComplete((v, e) -> {
+                    try {
+                        directoryWrapper.close();
+                    } catch (IOException ex) {
+                        throw LuceneExceptions.toRecordCoreException("Failed to close directory wrapper", ex,
+                                LuceneLogMessageKeys.GROUP, groupingKey,
+                                LuceneLogMessageKeys.INDEX_PARTITION, partitionId);
+                    }
+                });
+    }
+
+
+    private static boolean hasCause(@Nullable Throwable ex, Class<? extends Throwable> causeClass) {
+        // Similar methods are implemented elsewhere. TODO: create a common ExceptionsUtil
+        Set<Throwable> seenSet = Collections.newSetFromMap(new IdentityHashMap<>());
+        for (Throwable current = ex;
+                 current != null && !seenSet.contains(current);
+                 current = current.getCause()) {
+            if (causeClass.isInstance(current)) {
+                return true;
+            }
+            seenSet.add(current);
+        }
+        return false;
+    }
+
+    private static void closeOrAbortAgilityContext(AgilityContext agilityContext, Throwable ex) {
+        if (ex == null) {
+            agilityContext.flushAndClose();
+        } else {
+            agilityContext.abortAndClose();
+        }
+    }
+
+    private CompletableFuture<Integer> getNextOlderPartitionInfo(final Tuple groupingKey, final AgilityContext agileContext,
+                                                                 final AtomicReference<LucenePartitionInfoProto.LucenePartitionInfo> lastPartitionInfo) {
+        return agileContext.apply(context -> LucenePartitioner.getNextOlderPartitionInfo(
+                        context, groupingKey, lastPartitionInfo.get() == null ? null : LucenePartitioner.getPartitionKey(lastPartitionInfo.get()), state.indexSubspace)
+                .thenApply(partitionInfo -> {
+                    lastPartitionInfo.set(partitionInfo);
+                    return partitionInfo == null ? null : partitionInfo.getId();
+                }));
+    }
+
+    @SuppressWarnings("PMD.CloseResource")
+    public static CompletableFuture<Optional<Tuple>> nextTuple(@Nonnull FDBRecordContext context,
+                                                               @Nonnull Subspace subspace,
+                                                               @Nonnull KeyRange range,
+                                                               @Nonnull Optional<Tuple> lastTuple,
+                                                               @Nonnull ScanProperties scanProperties,
+                                                               int groupingCount) {
+        KeyValueCursor.Builder cursorBuilder =
+                KeyValueCursor.Builder.withSubspace(subspace)
+                        .setContext(context)
+                        .setContinuation(null)
+                        .setScanProperties(scanProperties);
+
+        if (lastTuple.isPresent()) {
+            final byte[] lowKey = subspace.pack(Tuple.fromItems(lastTuple.get().getItems().subList(0, groupingCount)));
+            cursorBuilder
+                    .setLow(lowKey, EndpointType.RANGE_EXCLUSIVE)
+                    .setHigh(range.getHighKey(), range.getHighEndpoint());
+        } else {
+            cursorBuilder.setContext(context)
+                    .setRange(range);
+        }
+
+        return cursorBuilder.build().onNext().thenApply(next -> {
+            if (next.hasNext()) {
+                KeyValue kv = next.get();
+                if (kv != null) {
+                    return Optional.of(subspace.unpack(kv.getKey()));
+                }
+            }
+            return Optional.empty();
+        });
+    }
+
+    /**
+     * Invalidate directories from the cache if their grouping key begins with a specified prefix.
+     * @param prefix the prefix of grouping keys to remove from the cache
+     */
+    public void invalidatePrefix(@Nonnull Tuple prefix) {
+        final Iterator<Map.Entry<Tuple, FDBDirectoryWrapper>> iterator = createdDirectories.entrySet().iterator();
+        while (iterator.hasNext()) {
+            Map.Entry<Tuple, FDBDirectoryWrapper> item = iterator.next();
+            if (TupleHelpers.isPrefix(prefix, item.getKey())) {
+                try {
+                    // Close the directory and associated readers/writers
+                    item.getValue().close();
+                } catch (IOException e) {
+                    throw LuceneExceptions.toRecordCoreException("unable to close index writer", e);
+                }
+                iterator.remove();
+            }
+        }
+    }
+
+    public PendingWriteQueue getPendingWriteQueue(@Nullable Tuple groupingKey, @Nullable Integer partitionId) {
+        return getDirectoryWrapper(groupingKey, partitionId).getPendingWriteQueue();
+    }
+
+    @VisibleForTesting
+    public FDBDirectoryWrapper getDirectoryWrapper(@Nullable Tuple groupingKey, @Nullable Integer partitionId) {
+        return getDirectoryWrapper(groupingKey, partitionId, getAgilityContext(false, false));
+    }
+
+    private FDBDirectoryWrapper getDirectoryWrapper(@Nullable Tuple groupingKey, @Nullable Integer partitionId, final AgilityContext agilityContext) {
+        final Tuple mapKey = getDirectoryKey(groupingKey, partitionId);
+        return createdDirectories.computeIfAbsent(mapKey, key -> createNewDirectoryWrapper(state, key, mergeDirectoryCount, agilityContext, getBlockCacheMaximumSize()));
+    }
+
+    private FDBDirectoryWrapper createDirectoryWrapper(@Nullable Tuple groupingKey, @Nullable Integer partitionId,
+                                                      final AgilityContext agilityContext) {
+        return createNewDirectoryWrapper(state, getDirectoryKey(groupingKey, partitionId), mergeDirectoryCount, agilityContext, getBlockCacheMaximumSize());
+    }
+
+    protected @Nonnull FDBDirectoryWrapper createNewDirectoryWrapper(final IndexMaintainerState state, final Tuple key, final int mergeDirectoryCount, final AgilityContext agilityContext, final int blockCacheMaximumSize) {
+        return new FDBDirectoryWrapper(state, key, mergeDirectoryCount, agilityContext, blockCacheMaximumSize,
+                writerAnalyzer, exceptionAtCreation);
+    }
+
+    private int getBlockCacheMaximumSize() {
+        return state.context.getPropertyStorage().getPropertyValue(LuceneRecordContextProperties.LUCENE_BLOCK_CACHE_MAXIMUM_SIZE);
+    }
+
+    private static Tuple getDirectoryKey(final @Nullable Tuple groupingKey, final @Nullable Integer partitionId) {
+        Tuple mapKey = groupingKey == null ? TupleHelpers.EMPTY : groupingKey;
+        if (partitionId != null) {
+            mapKey = mapKey.add(LucenePartitioner.PARTITION_DATA_SUBSPACE).add(partitionId);
+        }
+        return mapKey;
+    }
+
+    private AgilityContext getAgilityContext(boolean useAgilityContext, boolean allowDefaultPriority) {
+        final IndexDeferredMaintenanceControl deferredControl = state.store.getIndexDeferredMaintenanceControl();
+        if (!useAgilityContext || Boolean.TRUE.equals(state.context.getPropertyStorage().getPropertyValue(LuceneRecordContextProperties.LUCENE_AGILE_DISABLE_AGILITY_CONTEXT))) {
+            // Avoid potential retries:
+            deferredControl.setTimeQuotaMillis(0);
+            deferredControl.setSizeQuotaBytes(0);
+            return AgilityContext.nonAgile(state.context);
+        }
+        // Here: return an agile context
+        long timeQuotaMillis = deferredControl.getTimeQuotaMillis();
+        if (timeQuotaMillis <= 0) {
+            timeQuotaMillis = Objects.requireNonNullElse(state.context.getPropertyStorage().getPropertyValue(LuceneRecordContextProperties.LUCENE_AGILE_COMMIT_TIME_QUOTA), 4000);
+            deferredControl.setTimeQuotaMillis(timeQuotaMillis);
+        }
+        long sizeQuotaBytes = deferredControl.getSizeQuotaBytes();
+        if (sizeQuotaBytes <= 0) {
+            sizeQuotaBytes =  Objects.requireNonNullElse(state.context.getPropertyStorage().getPropertyValue(LuceneRecordContextProperties.LUCENE_AGILE_COMMIT_SIZE_QUOTA), 900_000);
+            deferredControl.setSizeQuotaBytes(sizeQuotaBytes);
+        }
+        boolean useDefaultPriorityDuringMerge = allowDefaultPriority && Objects.requireNonNullElse(state.context.getPropertyStorage().getPropertyValue(LuceneRecordContextProperties.LUCENE_USE_DEFAULT_PRIORITY_DURING_MERGE), true);
+        if (useDefaultPriorityDuringMerge) {
+            final FDBRecordContextConfig.Builder contextBuilder = state.context.getConfig().toBuilder();
+            contextBuilder.setPriority(FDBTransactionPriority.DEFAULT);
+            return AgilityContext.agile(state.context, contextBuilder, timeQuotaMillis, sizeQuotaBytes);
+        } else {
+            return AgilityContext.agile(state.context, timeQuotaMillis, sizeQuotaBytes);
+        }
+    }
+
+    @Nonnull
+    public FDBDirectory getDirectory(@Nullable Tuple groupingKey, @Nullable Integer partitionId) {
+        return getDirectoryWrapper(groupingKey, partitionId).getDirectory();
+    }
+
+    public IndexReader getIndexReader(@Nullable Tuple groupingKey, @Nullable Integer partitionId) throws IOException {
+        return getDirectoryWrapper(groupingKey, partitionId).getReader();
+    }
+
+    @Nonnull
+    public IndexWriter getIndexWriter(@Nullable Tuple groupingKey, @Nullable Integer partitionId) throws IOException {
+        return getDirectoryWrapper(groupingKey, partitionId).getWriter();
+    }
+
+    @Nonnull
+    public IndexReader getIndexReaderWithReplayedQueue(@Nullable Tuple groupingKey, @Nullable Integer partitionId) throws IOException {
+        return getDirectoryWrapper(groupingKey, partitionId).getIndexReaderWithReplayedQueue();
+    }
+
+    public DirectoryReader getWriterReader(@Nullable Tuple groupingKey, @Nullable Integer partitionId) throws IOException {
+        return getWriterReader(groupingKey, partitionId, false);
+    }
+
+    public DirectoryReader getWriterReader(@Nullable Tuple groupingKey, @Nullable Integer partititonId, boolean refresh) throws IOException {
+        return getDirectoryWrapper(groupingKey, partititonId).getWriterReader(refresh);
+    }
+
+    @Nonnull
+    public static FDBDirectoryManager getManager(@Nonnull IndexMaintainerState state) {
+        return getOrCreateManager(state, () -> new FDBDirectoryManager(state));
+    }
+
+    @SuppressWarnings("PMD.CloseResource")
+    protected static @Nonnull FDBDirectoryManager getOrCreateManager(final @Nonnull IndexMaintainerState state, Supplier<FDBDirectoryManager> managerSupplier) {
+        synchronized (state.context) {
+            FDBRecordContext context = state.context;
+            FDBDirectoryManager existing = context.getInSession(state.indexSubspace, FDBDirectoryManager.class);
+            if (existing != null) {
+                return existing;
+            }
+            FDBDirectoryManager newManager = managerSupplier.get();
+            context.putInSessionIfAbsent(state.indexSubspace, newManager);
+            // Since the manager is scoped to the transaction, close it once the transaction closes.
+            // call close() before the transaction commits to ensure Lucene has committed its in-memory structures back to FDB.
+            context.addCommitCheck(() -> {
+                try {
+                    newManager.close();
+                } catch (IOException e) {
+                    throw LuceneExceptions.toRecordCoreException("unable to close directories", e);
+                } finally {
+                    newManager.closed = true;
+                }
+                return AsyncUtil.DONE;
+            });
+            // Call closeWithoutCommit once the transaction closes. If the transaction was committed, then close() was
+            // called (see above) so this would be a noop. If the transaction was not committed, we still need to close
+            // the created directoryWrappers, so call their closeWithoutCommit().
+            // For each context, there should be only one manager per index, so the name is qualified by index
+            final String hookName = "DirectoryManager/" + state.index.getName();
+            context.addPostCloseHook(hookName, () -> {
+                try {
+                    if (!newManager.closed) {
+                        newManager.closeWithoutCommit();
+                    }
+                } catch (IOException e) {
+                    throw LuceneExceptions.toRecordCoreException("unable to closeWithoutCommit directories", e);
+                } finally {
+                    newManager.closed = true;
+                }
+                return AsyncUtil.DONE;
+            });
+            return newManager;
+        }
+    }
+
+    private int getMergeDirectoryCount(@Nonnull IndexMaintainerState state) {
+        return Math.toIntExact(state.store
+                .getRecordMetaData()
+                .getAllIndexes()
+                .stream()
+                .filter(i -> LuceneIndexTypes.LUCENE.equals(i.getType()))
+                .count());
+    }
+
+    /**
+     * A Utility to create a callback to invoke {@link FDBDirectoryWrapper#closeWithoutCommit()}.
+     * Needed in order to wrap the exception.
+     *
+     * @param wrapper the wrapper to invoke
+     * @return a callback that can be given to the {@link CloseableUtils}
+     */
+    private Supplier<Void> closeWithoutCommitCallback(FDBDirectoryWrapper wrapper) {
+        return () -> {
+            try {
+                wrapper.closeWithoutCommit();
+                return null;
+            } catch (IOException ex) {
+                throw new CompletionException(ex);
+            }
+        };
+    }
+}

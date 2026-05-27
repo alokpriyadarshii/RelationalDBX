@@ -1,0 +1,79 @@
+/*
+ * relationaldbx-spatial.gradle
+ *
+ * This source file is part of the FoundationDB open source project
+ *
+ * Copyright 2015-2019 Apple Inc. and the FoundationDB project authors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+apply from: rootProject.file('gradle/proto.gradle')
+apply from: rootProject.file('gradle/publishing.gradle')
+
+def coreProject = ":${ext.coreProjectName}"
+dependencies {
+    api project(coreProject)
+    implementation(libs.jts)
+    implementation(libs.geophile)
+    implementation(libs.protobuf)
+    implementation(libs.slf4j.api)
+    implementation(libs.slf4j.julBridge)
+    compileOnly(libs.jsr305)
+    compileOnly(libs.autoService)
+    annotationProcessor(libs.autoService)
+
+    testImplementation(libs.bundles.test.impl)
+    testRuntimeOnly(libs.bundles.test.runtime)
+    testCompileOnly(libs.bundles.test.compileOnly)
+    testImplementation(libs.snakeyaml)
+    testImplementation project(':relationaldbx-test-utils')
+    testImplementation project(path: coreProject, configuration: 'tests')
+}
+
+def geonames_files = ['countryInfo.txt', 'cities15000.zip', 'shapes_all_low.zip']
+
+task downloadGeonames(type: de.undercouch.gradle.tasks.download.Download) {
+    // src geonames_files.collect { file -> "http://download.geonames.org/export/dump/${file}" }
+    /* some times geonames times out or is otherwise unreliable, move files to
+    an s3 bucket that we control for more consistent download behavior */
+    src geonames_files.collect { file -> "https://relationaldbx.s3.amazonaws.com/geonames/${file}" }
+    dest layout.buildDirectory.dir("geonames").get().asFile
+    overwrite false         // Don't need the very latest.
+}
+
+task unzipGeonames(dependsOn: downloadGeonames, type: Copy) {
+    into layout.buildDirectory.dir("geonames")
+    geonames_files.each { file ->
+        if (file.endsWith('.zip')) {
+            from zipTree(layout.buildDirectory.dir("geonames").map { d ->
+                d.file(file).asFile
+            }.get())
+        }
+    }
+}
+
+def skipSlow = System.getenv('SKIP_SLOW_TESTS') != null && System.getenv('SKIP_SLOW_TESTS') == 'true'
+if (!skipSlow) {
+    test.dependsOn unzipGeonames
+}
+
+publishing {
+    publications {
+        library(MavenPublication) {
+            pom {
+                description = 'Spatial index support for relationaldbx'
+            }
+        }
+    }
+}
