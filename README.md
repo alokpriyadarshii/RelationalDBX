@@ -34,27 +34,187 @@ The project is organized as a Gradle multi module Java codebase. It includes the
 
 ## Project Structure
 
-| Path | Purpose |
-| --- | --- |
-| `relationaldbx-core` | Core record-layer storage, metadata, query, and indexing functionality. |
-| `relationaldbx-core-shaded` | Shaded core artifact packaging. |
-| `relationaldbx-relational-api` | Relational API interfaces and common types. |
-| `relationaldbx-relational-core` | SQL/relational implementation and embedded JDBC support. |
-| `relationaldbx-relational-jdbc` | JDBC driver for remote gRPC server access. |
-| `relationaldbx-relational-grpc` | gRPC protocol and generated service/message classes. |
-| `relationaldbx-relational-server` | RelationalDBX gRPC server with Prometheus metrics endpoint. |
-| `relationaldbx-relational-cli` | SQLLine-based command-line client. |
-| `relationaldbx-lucene` | Lucene directory, index maintenance, and scan support. |
-| `relationaldbx-spatial` | Spatial indexing and geometry support. |
-| `relationaldbx-icu` | ICU-related functionality. |
-| `relationaldbx-extensions` | Extension points and shared utilities. |
-| `relationaldbx-debugger` | Query planner/debugging utilities. |
-| `relationaldbx-test-utils` | Shared testing helpers. |
-| `yaml-tests` | YAML SQL test infrastructure. |
-| `examples` | Example Java usage and JDBC snippets. |
-| `docs/sphinx` | Documentation source. |
-| `docker-local` | Local FoundationDB Docker helper scripts. |
-| `gradle` | Shared Gradle build logic. |
+```text
+RelationalDBX/
+├── README.md
+├── LICENSE
+├── ACKNOWLEDGEMENTS
+├── build.gradle
+├── settings.gradle
+├── gradle.properties
+├── gradlew
+├── gradlew.bat
+├── package.json
+├── vercel.json
+├── public/
+│   └── index.html
+├── gradle/
+│   ├── wrapper/
+│   ├── libs.versions.toml
+│   ├── root.gradle
+│   ├── testing.gradle
+│   ├── publishing.gradle
+│   ├── proto.gradle
+│   ├── antlr.gradle
+│   └── sphinx.gradle
+├── docs/
+│   └── sphinx/
+├── docker-local/
+│   ├── docker-compose.yml
+│   ├── relationaldbx-build.sh
+│   ├── start.sh
+│   └── stop.sh
+├── scripts/
+│   ├── YAML-SQL.xml
+│   └── requirements.txt
+├── actions/
+│   ├── gradle-test/
+│   ├── run-gradle/
+│   ├── setup-base-env/
+│   ├── setup-relationaldbx/
+│   ├── list-recent-versions/
+│   ├── publish-mixed-mode-results/
+│   └── teamscale-upload/
+├── examples/
+│   ├── examples.gradle
+│   └── src/
+│       └── main/
+│           ├── java/
+│           ├── proto/
+│           ├── resources/
+│           └── javadoc/
+├── relationaldbx-core/
+│   ├── relationaldbx-core.gradle
+│   └── src/
+│       ├── main/
+│       │   ├── java/
+│       │   ├── proto/
+│       │   ├── resources/
+│       │   └── javadoc/
+│       └── test/
+│           ├── java/
+│           ├── proto/
+│           └── resources/
+├── relationaldbx-core-shaded/
+│   └── relationaldbx-core-shaded.gradle
+├── relationaldbx-java-annotations/
+│   ├── relationaldbx-java-annotations.gradle
+│   └── src/
+│       └── main/
+│           └── java/
+├── relationaldbx-test-utils/
+│   ├── relationaldbx-test-utils.gradle
+│   └── src/
+│       ├── main/java/
+│       └── test/java/
+├── relationaldbx-extensions/
+│   ├── relationaldbx-extensions.gradle
+│   └── src/
+│       ├── main/java/
+│       ├── test/java/
+│       └── testFixtures/java/
+├── relationaldbx-debugger/
+│   ├── relationaldbx-debugger.gradle
+│   └── src/
+│       ├── main/java/
+│       └── test/java/
+├── relationaldbx-icu/
+│   ├── relationaldbx-icu.gradle
+│   └── src/
+│       ├── main/java/
+│       └── test/java/
+├── relationaldbx-lucene/
+│   ├── README.md
+│   ├── relationaldbx-lucene.gradle
+│   ├── docs/
+│   └── src/
+│       ├── main/
+│       │   ├── java/
+│       │   ├── proto/
+│       │   ├── resources/
+│       │   └── javadoc/
+│       └── test/java/
+├── relationaldbx-spatial/
+│   ├── relationaldbx-spatial.gradle
+│   └── src/
+│       ├── main/java/
+│       └── test/
+│           ├── java/
+│           └── proto/
+├── relationaldbx-jmh/
+│   ├── relationaldbx-jmh.gradle
+│   └── src/
+│       └── jmh/
+│           ├── java/
+│           └── proto/
+├── relationaldbx-relational-api/
+│   ├── README.md
+│   ├── relationaldbx-relational-api.gradle
+│   └── src/
+│       ├── main/java/
+│       ├── test/
+│       │   ├── java/
+│       │   └── resources/
+│       └── testFixtures/java/
+├── relationaldbx-relational-core/
+│   ├── README.md
+│   ├── relationaldbx-relational-core.gradle
+│   └── src/
+│       ├── main/
+│       │   ├── antlr/
+│       │   ├── java/
+│       │   └── proto/
+│       ├── test/
+│       │   ├── java/
+│       │   └── resources/
+│       ├── testFixtures/java/
+│       └── jmh/java/
+├── relationaldbx-relational-grpc/
+│   ├── README.md
+│   ├── relationaldbx-relational-grpc.gradle
+│   └── src/
+│       ├── main/
+│       │   ├── java/
+│       │   └── proto/
+│       └── test/
+│           ├── java/
+│           └── resources/
+├── relationaldbx-relational-jdbc/
+│   ├── relationaldbx-relational-jdbc.gradle
+│   └── src/
+│       ├── main/
+│       │   ├── java/
+│       │   └── resources/
+│       └── test/
+│           ├── java/
+│           └── resources/
+├── relationaldbx-relational-server/
+│   ├── relationaldbx-relational-server.gradle
+│   ├── bin/
+│   └── src/
+│       ├── main/
+│       │   ├── java/
+│       │   ├── resources/
+│       │   └── dist/
+│       ├── test/
+│       │   ├── java/
+│       │   └── resources/
+│       └── testFixtures/java/
+├── relationaldbx-relational-cli/
+│   ├── relationaldbx-relational-cli.gradle
+│   └── bin/
+└── yaml-tests/
+    ├── yaml-tests.gradle
+    └── src/
+        ├── main/
+        │   ├── java/
+        │   ├── proto/
+        │   └── resources/
+        └── test/
+            ├── java/
+            ├── proto/
+            └── resources/
+```
 
 ## Requirements
 
