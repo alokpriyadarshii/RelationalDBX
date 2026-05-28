@@ -19,9 +19,9 @@ The project is organized as a Gradle multi module Java codebase. It includes the
 
 ## Tech Stack
 
-| Area | Technology |
+| Category | Technology |
 | --- | --- |
-| Language | Java 17 |
+| Programming Language | Java 17 |
 | Build tool | Gradle wrapper |
 | Storage engine | FoundationDB |
 | API style | JDBC, gRPC, Java APIs |
